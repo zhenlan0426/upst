@@ -21,6 +21,8 @@ is required.
 from typing import Any, List
 import json
 import os
+import html
+import re
 
 import pandas as pd
 
@@ -97,6 +99,49 @@ def _serialise_opaque(val: Any) -> str | None:
     return str(val) if val is not None else None
 
 
+def _clean_content(content: Any) -> str | None:
+    """Clean HTML content by decoding entities and stripping tags.
+    
+    Converts HTML-encoded job posting content into clean, readable plain text.
+    This includes:
+    1. Decoding HTML entities (&lt; → <, &gt; → >, &amp; → &, etc.)
+    2. Stripping all HTML tags
+    3. Normalizing whitespace (multiple spaces/newlines → single space)
+    4. Handling special cases like &nbsp; and other whitespace entities
+    """
+    
+    if content is None:
+        return None
+    
+    content_str = str(content).strip()
+    if not content_str:
+        return None
+    
+    # Decode HTML entities (e.g., &lt; → <, &gt; → >, &amp; → &, &nbsp; → space)
+    decoded = html.unescape(content_str)
+    
+    # Remove HTML tags using regex
+    # This regex matches opening tags, closing tags, and self-closing tags
+    clean_text = re.sub(r'<[^>]+>', '', decoded)
+    
+    # Handle special whitespace cases:
+    # 1. Replace multiple whitespace chars (spaces, tabs, newlines) with single space
+    # 2. Handle any remaining HTML entities that might have been missed
+    clean_text = re.sub(r'\s+', ' ', clean_text)
+    
+    # Remove any remaining HTML artifacts or special characters
+    # Handle cases like &nbsp; that might still be present
+    clean_text = re.sub(r'&[a-zA-Z0-9#]+;', ' ', clean_text)
+    
+    # Final whitespace cleanup - replace multiple spaces with single space
+    clean_text = re.sub(r' +', ' ', clean_text)
+    
+    # Strip leading/trailing whitespace
+    clean_text = clean_text.strip()
+    
+    return clean_text if clean_text else None
+
+
 # ---------------------------------------------------------------------------
 # Public cleaning routine
 # ---------------------------------------------------------------------------
@@ -113,6 +158,7 @@ def clean_nested_columns(df: pd.DataFrame) -> pd.DataFrame:
     2. ``departments``         → comma-separated list of department names
     3. ``offices``             → comma-separated list of office locations
     4. ``data_compliance``     → JSON string (kept for completeness)
+    5. ``content``             → cleaned HTML content (entities decoded, tags stripped)
 
     Any additional columns containing nested data can be appended to
     ``_NESTED_COLUMNS`` below with an appropriate handler.
@@ -131,6 +177,7 @@ def clean_nested_columns(df: pd.DataFrame) -> pd.DataFrame:
         "departments": _list_of_dicts_to_names,
         "offices": _list_of_dicts_to_names,
         "data_compliance": _serialise_opaque,
+        "content": _clean_content,
         "company_name": lambda x: None,  # Remove this redundant field
     }
 
