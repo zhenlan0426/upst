@@ -23,26 +23,25 @@ This framework is designed to periodically monitor Upstart's open job positions 
 
 ---
 
-### 2. Data Storage Module
-**Purpose:** Store job posting data persistently to track changes over time.
+## 2  Storage Layout (`data/raw/`)
+```
+data/raw/
+└─ snapshot_date=2025-06-29/
+   └─ part-000.parquet
+```
+### Schema
+| Column            | Type  | Notes |
+|-------------------|-------|-------|
+| `job_id`          | INT   | Upstart ID |
+| `snapshot_date`   | DATE  | **Partition key** |
+| `title`           | STRING |  |
+| `department`      | STRING |  |
+| `employment_type` | STRING |  |
+| `salary_min/max`  | INT   | USD |
+| `seniority`       | STRING | Derived via regex |
+| …                 | …      | New nullable columns allowed |
 
-- **Database Choice:** Use SQLite for simplicity or PostgreSQL for scalability.
-- **Schema:**
-  - **Jobs Table:** Stores static job details.
-    - Columns: `job_id` (unique), `title`, `department`, `location`, `salary_range`, `description`.
-  - **Scrapes Table:** Logs each scraping event.
-    - Columns: `scrape_id`, `scrape_date`.
-  - **Job_Scrapes Table:** Tracks job presence across scrapes.
-    - Columns: `job_id`, `scrape_id`.
-  - **Job_Changes Table:** Captures field-level changes across scrapes.
-    - Columns: `change_id`, `job_id`, `field_name`, `old_value`, `new_value`, `changed_at`.
-- **Functionality:**
-  - Insert new job data with timestamps.
-  - Query historical data for trend analysis.
-- **Considerations:**
-  - Store descriptions in the database or fetch on-demand for analysis.
-  - Use timestamps to approximate posting and closing dates.
-  - Add indexes on `job_id` and composite (`job_id`, `scrape_id`) columns to speed up temporal queries.
+*Primary key*: (`job_id`, `snapshot_date`). Duplicates dropped on ingest.
 
 ---
 

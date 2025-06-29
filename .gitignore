@@ -1,0 +1,20 @@
+# Ignore everything by default
+*
+
+# Don't ignore directories, so we can whitelist files inside them
+!*/
+
+# Whitelist Python files
+!*.py
+
+# Whitelist Markdown files
+!*.md
+
+# Whitelist requirements
+!requirements.txt
+
+# Don't ignore the .gitignore file itself
+!.gitignore
+
+# Ignore venv
+.venv/
