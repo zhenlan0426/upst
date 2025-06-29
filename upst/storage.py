@@ -29,14 +29,17 @@ import pandas as pd
 
 __all__ = [
     "RAW_ROOT",
+    "CLEAN_ROOT",
     "write_snapshot",
     "load_raw",
+    "load_clean",
 ]
 
 # Project-relative root where raw data live.  During unit tests callers can
 # pass a different directory to each function so the default should *not*
 # be resolved eagerly (so that tmp_path fixtures work nicely).
 RAW_ROOT = Path("data") / "raw"
+CLEAN_ROOT = Path("data") / "clean"
 
 
 def write_snapshot(
@@ -92,9 +95,28 @@ def write_snapshot(
     # ---------------------------------------------------------------------
     df = pd.DataFrame(jobs)
 
-    # Rename id -> job_id to align with Implementation_framework.md.
-    if "id" in df.columns and "job_id" not in df.columns:
-        df = df.rename(columns={"id": "job_id"})
+    # Determine canonical primary-key column *job_id*.
+    # Greenhouse exposes multiple identifiers – we treat ``requisition_id``
+    # as the stable public ID.  Fallbacks retain compatibility with older
+    # scrapes that used ``id``.
+
+    if "job_id" not in df.columns:
+        if "requisition_id" in df.columns:
+            df = df.rename(columns={"requisition_id": "job_id"})
+        elif "id" in df.columns:
+            df = df.rename(columns={"id": "job_id"})
+
+    # Drop legacy / unneeded identifier columns to keep the schema lean.
+    _DROP_COLS = [
+        "id",  # Greenhouse internal – replaced by requisition_id → job_id
+        "internal_job_id",  # rarely useful, verbose GUID
+        "metadata",  # opaque misc structure
+        "data_compliance",  # only relevant to GH front-end
+        "company_name",  # redundant for Upstart-specific scraper
+    ]
+    cols_to_drop = [c for c in _DROP_COLS if c in df.columns]
+    if cols_to_drop:
+        df = df.drop(columns=cols_to_drop)
 
     # Ensure snapshot_date column exists (string / ISO date).
     if "snapshot_date" not in df.columns:
@@ -157,8 +179,24 @@ def load_raw(*, base_dir: str | Path = RAW_ROOT) -> pd.DataFrame:
             print(f"[warn] Could not read {fp}: {exc}")
             continue
 
-        if "id" in df.columns and "job_id" not in df.columns:
-            df = df.rename(columns={"id": "job_id"})
+        # Harmonise job identifier as above when loading from disk as the
+        # snapshot may pre-date the schema change.
+        if "job_id" not in df.columns:
+            if "requisition_id" in df.columns:
+                df = df.rename(columns={"requisition_id": "job_id"})
+            elif "id" in df.columns:
+                df = df.rename(columns={"id": "job_id"})
+
+        # Drop unwanted columns consistently with write_snapshot().
+        drop_cols = [c for c in [
+            "id",
+            "internal_job_id",
+            "metadata",
+            "data_compliance",
+            "company_name",
+        ] if c in df.columns]
+        if drop_cols:
+            df = df.drop(columns=drop_cols)
 
         frames.append(df)
 
@@ -169,5 +207,77 @@ def load_raw(*, base_dir: str | Path = RAW_ROOT) -> pd.DataFrame:
 
     # Deduplicate across *all* snapshots.  Keep "first" so the earliest file on disk wins.
     consolidated = consolidated.drop_duplicates(subset=["job_id", "snapshot_date"], keep="first")
+
+    return consolidated
+
+
+def load_clean(*, base_dir: str | Path = CLEAN_ROOT) -> pd.DataFrame:
+    """Load *all* cleaned snapshots into a single ``pandas.DataFrame``.
+
+    This function is similar to load_raw() but loads from the data/clean 
+    directory where cleaned, flattened data is stored.
+
+    The function recursively finds every *part-*.parquet* file, concatenates
+    them **row-wise**, enforces the `(job_id, snapshot_date)` primary key and
+    returns the de-duplicated DataFrame.  If no snapshots exist an *empty*
+    DataFrame with the expected columns is returned.
+    """
+
+    root = Path(base_dir)
+    if not root.exists():
+        # Return an empty frame with the canonical columns so downstream code
+        # does not have to special-case missing data.
+        return pd.DataFrame(
+            columns=[
+                "job_id",
+                "snapshot_date",
+                "title",
+                "department",
+                "employment_type",
+                "salary_min",
+                "salary_max",
+                "seniority",
+                "location",
+                "departments",
+                "offices",
+            ]
+        )
+
+    # glob is safe here – the directory structure is flat beyond the partition
+    # level.  Using rglob would work too but is slower.
+    files = list(root.glob("snapshot_date=*/part-*.parquet"))
+    if not files:
+        return pd.DataFrame()
+
+    frames = []
+    for fp in files:
+        try:
+            df = pd.read_parquet(fp)
+        except Exception as exc:
+            # Log and skip corrupted file rather than failing entirely.
+            print(f"[warn] Could not read {fp}: {exc}")
+            continue
+
+        # Drop unwanted columns consistently with write_snapshot().
+        drop_cols = [c for c in [
+            "id",
+            "internal_job_id",
+            "metadata",
+            "data_compliance",
+            "company_name",
+        ] if c in df.columns]
+        if drop_cols:
+            df = df.drop(columns=drop_cols)
+
+        frames.append(df)
+
+    if not frames:
+        return pd.DataFrame()
+
+    consolidated = pd.concat(frames, ignore_index=True, copy=False)
+
+    # Deduplicate across *all* snapshots.  Keep "first" so the earliest file on disk wins.
+    if "job_id" in consolidated.columns and "snapshot_date" in consolidated.columns:
+        consolidated = consolidated.drop_duplicates(subset=["job_id", "snapshot_date"], keep="first")
 
     return consolidated 

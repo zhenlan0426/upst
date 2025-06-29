@@ -10,11 +10,11 @@ on Greenhouse's JSON API which powers the career site. As such it is
 faster, less brittle and friendly to the website.
 
 Usage (command line):
-    python -m upst.scraper  # stores raw JSON in data/raw/<timestamp>.json
+    python -m upst.scraper  # scrapes, cleans, and stores cleaned data
 
 Inside Python code:
     from upst.scraper import scrape_sync
-    jobs = scrape_sync(concurrency=10)
+    jobs = scrape_sync(concurrency=10)  # returns cleaned data
 """
 
 from __future__ import annotations
@@ -29,6 +29,7 @@ from pathlib import Path
 from typing import Any, List
 
 import aiohttp
+import pandas as pd
 
 # ---------------------------------------------------------------------------
 # Configuration constants
@@ -112,18 +113,22 @@ async def _fetch_job_detail(job_id: int | str, session: aiohttp.ClientSession, s
     return await _fetch_json(url, session, semaphore=semaphore)
 
 
-async def scrape(*, concurrency: int = DEFAULT_CONCURRENCY) -> List[dict[str, Any]]:  # noqa: D401
-    """Scrape Upstart job postings.
+async def scrape(*, concurrency: int = DEFAULT_CONCURRENCY, clean_data: bool = True) -> List[dict[str, Any]]:  # noqa: D401
+    """Scrape Upstart job postings and optionally clean the data.
 
     Parameters
     ----------
     concurrency
         Maximum concurrent network requests.
+    clean_data
+        Whether to apply data cleaning transformations to the scraped data.
 
     Returns
     -------
     list of dict
-        Detailed job payloads in the same shape returned by Greenhouse.
+        Job payloads. If clean_data=True, nested structures are flattened
+        and the data is analysis-ready. If clean_data=False, returns raw
+        Greenhouse API payloads.
     """
 
     semaphore = asyncio.Semaphore(concurrency)
@@ -145,9 +150,32 @@ async def scrape(*, concurrency: int = DEFAULT_CONCURRENCY) -> List[dict[str, An
     for job in detailed_jobs:
         if job is None:
             continue
-        # Ensure we do not overwrite the field if Greenhouse ever adds it.
-        job["snapshot_date"] = snapshot_date  # partition key used downstream
+        # Rename and prune fields so downstream schema is lean & consistent.
+
+        # Canonical job identifier.
+        if "job_id" not in job:
+            if "requisition_id" in job:
+                job["job_id"] = job.pop("requisition_id")
+            elif "id" in job:
+                job["job_id"] = job["id"]  # keep a copy; we'll drop "id" later
+
+        # Remove noisy / unused fields.
+        for _k in ("id", "internal_job_id", "metadata", "data_compliance", "company_name"):
+            job.pop(_k, None)
+
+        # Add snapshot partition key (do *after* renaming to avoid conflicts).
+        job["snapshot_date"] = snapshot_date
+
         enriched.append(job)
+
+    # Apply data cleaning if requested
+    if clean_data and enriched:
+        from .clean import clean_nested_columns
+        
+        # Convert to DataFrame, clean, and convert back to list of dicts
+        df = pd.DataFrame(enriched)
+        cleaned_df = clean_nested_columns(df)
+        enriched = cleaned_df.to_dict(orient="records")
 
     return enriched
 
@@ -157,55 +185,14 @@ async def scrape(*, concurrency: int = DEFAULT_CONCURRENCY) -> List[dict[str, An
 # ---------------------------------------------------------------------------
 
 
-def scrape_sync(concurrency: int = DEFAULT_CONCURRENCY) -> List[dict[str, Any]]:
+def scrape_sync(concurrency: int = DEFAULT_CONCURRENCY, clean_data: bool = True) -> List[dict[str, Any]]:
     """Blocking wrapper around `scrape()` suitable for synchronous code."""
 
-    return asyncio.run(scrape(concurrency=concurrency))
-
-
-def _store_raw(jobs: List[dict[str, Any]], *, out_dir: str | os.PathLike = "data/raw") -> Path:
-    """Persist job payloads under *out_dir* partitioned by snapshot_date.
-
-    The data are written as Parquet (preferred). If Parquet dependencies are
-    unavailable, the function gracefully falls back to line-delimited JSON so
-    that no data are lost."""
-
-    # Determine partition directory using snapshot_date information. We expect every job
-    # dict to carry this key thanks to `scrape()`. Fallback to today if list is empty.
-    if jobs and "snapshot_date" in jobs[0]:
-        snapshot_date = jobs[0]["snapshot_date"]  # yyyy-mm-dd
-    else:
-        snapshot_date = datetime.now(timezone.utc).date().isoformat()
-
-    partition_dir = Path(out_dir) / f"snapshot_date={snapshot_date}"
-    partition_dir.mkdir(parents=True, exist_ok=True)
-
-    # File naming scheme: part-<timestamp>.parquet so multiple runs append cleanly.
-    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-    out_path = partition_dir / f"part-{timestamp}.parquet"
-
-    # Serialize to Parquet for efficient analytics downstream.
-    try:
-        import pandas as pd  # Lazy import to keep top-level requirements light for users.
-
-        df = pd.DataFrame(jobs)
-        # Ensure consistent column order (optional) – rely on pandas default otherwise.
-        df.to_parquet(out_path, index=False)
-    except Exception as exc:  # Broad except to fall back to JSON if Parquet write fails.
-        # Fallback path keeps data accessible even without pyarrow installed.
-        json_fallback = out_path.with_suffix(".json")
-        json_fallback.write_text(json.dumps(jobs, indent=2))
-        out_path = json_fallback
-        print(
-            f"[warn] Could not write Parquet ({exc}). Wrote JSON to {json_fallback}",
-            file=sys.stderr,
-        )
-
-    return out_path
+    return asyncio.run(scrape(concurrency=concurrency, clean_data=clean_data))
 
 
 def main(argv: list[str] | None = None) -> None:  # pragma: no cover
-    """CLI entry-point: fetch & persist job postings, print summary."""
+    """CLI entry-point: fetch, clean, and persist job postings."""
 
     argv = argv or sys.argv[1:]
     # Very light arg-parse (only concurrency for now)
@@ -216,23 +203,28 @@ def main(argv: list[str] | None = None) -> None:  # pragma: no cover
         sys.exit(1)
 
     print(f"[info] Scraping Upstart jobs with concurrency={concurrency} …")
-    jobs = scrape_sync(concurrency=concurrency)
-    print(f"[info] Retrieved {len(jobs)} detailed job postings.")
+    jobs = scrape_sync(concurrency=concurrency, clean_data=True)
+    print(f"[info] Retrieved and cleaned {len(jobs)} job postings.")
 
-    # Always save to the project's data/raw directory.
-    project_root = Path(__file__).parent.parent
-    output_dir = project_root / "data" / "raw"
-    path = _store_raw(jobs, out_dir=output_dir)
-    # If the returned path is already relative, printing it directly is fine. However,
-    # when the path is absolute we prefer a cleaner relative representation for UX.
-    try:
-        display_path = path.relative_to(Path.cwd())
-    except ValueError:
-        # `path` is not under the current working directory (or is already relative)
-        # so just use it as-is.
-        display_path = path
+    # Store cleaned data using the storage module
+    from .storage import write_snapshot
+    
+    if jobs:
+        # Determine output directory
+        project_root = Path(__file__).parent.parent
+        output_dir = project_root / "data" / "clean"
+        
+        path = write_snapshot(jobs, out_dir=output_dir)
+        
+        # Display relative path for better UX
+        try:
+            display_path = path.relative_to(Path.cwd())
+        except ValueError:
+            display_path = path
 
-    print(f"[info] Raw JSON saved to {display_path}")
+        print(f"[info] Cleaned data saved to {display_path}")
+    else:
+        print("[warn] No jobs retrieved, nothing to save.")
 
 
 if __name__ == "__main__":
