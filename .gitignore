@@ -7,6 +7,9 @@
 # Whitelist Python files
 !*.py
 
+# Whitelist Jupyter notebooks
+!*.ipynb
+
 # Whitelist Markdown files
 !*.md
 
