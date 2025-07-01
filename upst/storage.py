@@ -211,7 +211,7 @@ def load_raw(*, base_dir: str | Path = RAW_ROOT) -> pd.DataFrame:
     return consolidated
 
 
-def load_clean(*, base_dir: str | Path = CLEAN_ROOT) -> pd.DataFrame:
+def load_clean(*, base_dir: str | Path = CLEAN_ROOT, latest_only: bool = False) -> pd.DataFrame:
     """Load *all* cleaned snapshots into a single ``pandas.DataFrame``.
 
     This function is similar to load_raw() but loads from the data/clean 
@@ -221,6 +221,10 @@ def load_clean(*, base_dir: str | Path = CLEAN_ROOT) -> pd.DataFrame:
     them **row-wise**, enforces the `(job_id, snapshot_date)` primary key and
     returns the de-duplicated DataFrame.  If no snapshots exist an *empty*
     DataFrame with the expected columns is returned.
+
+    Args:
+        base_dir: Directory to load from (defaults to CLEAN_ROOT)
+        latest_only: If True, only load data from the most recent snapshot_date
     """
 
     root = Path(base_dir)
@@ -248,6 +252,19 @@ def load_clean(*, base_dir: str | Path = CLEAN_ROOT) -> pd.DataFrame:
     files = list(root.glob("snapshot_date=*/part-*.parquet"))
     if not files:
         return pd.DataFrame()
+
+    # If latest_only is True, filter to only the most recent snapshot_date
+    if latest_only:
+        # Extract snapshot dates from file paths and find the latest
+        snapshot_dates = set()
+        for fp in files:
+            # Extract date from path like "snapshot_date=2024-01-15/part-000.parquet"
+            date_part = fp.parent.name.split("=")[1]
+            snapshot_dates.add(date_part)
+        
+        if snapshot_dates:
+            latest_date = max(snapshot_dates)
+            files = [fp for fp in files if f"snapshot_date={latest_date}" in str(fp)]
 
     frames = []
     for fp in files:
